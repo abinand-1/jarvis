@@ -11,6 +11,7 @@ import subprocess
 from datetime import datetime
 
 import numpy as np
+import requests
 import sounddevice as sd
 import webrtcvad
 import ollama
@@ -37,11 +38,42 @@ OWW_CHUNK_SAMPLES = 1280
 
 WHISPER_PROMPT = "Open Spotify, WhatsApp, Netflix, YouTube, Chrome, Settings, Calculator, Terminal, Camera, After Effects."
 
+# Default location for weather when no city is mentioned - update these to
+# your actual coordinates for accurate local weather.
+HOME_LAT = 11.2588
+HOME_LON = 75.7804
+HOME_LOCATION_NAME = "home"
+
+# Apps that are more reliably opened as a website than found in the Windows
+# Start Menu index (they're usually PWAs/web apps, not installed natively).
+WEB_APPS = {
+    "whatsapp": "https://web.whatsapp.com",
+    "netflix": "https://www.netflix.com",
+    "youtube": "https://www.youtube.com",
+    "gmail": "https://mail.google.com",
+}
+
+# WMO weather codes -> plain-language description (Open-Meteo uses these)
+WEATHER_CODES = {
+    0: "clear skies", 1: "mostly clear skies", 2: "partly cloudy skies", 3: "overcast skies",
+    45: "fog", 48: "depositing rime fog",
+    51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
+    61: "light rain", 63: "moderate rain", 65: "heavy rain",
+    71: "light snow", 73: "moderate snow", 75: "heavy snow",
+    80: "light rain showers", 81: "moderate rain showers", 82: "violent rain showers",
+    95: "thunderstorms", 96: "thunderstorms with light hail", 99: "thunderstorms with heavy hail",
+}
+
 # --- Precompiled Regex Patterns for Performance ---
 WAKE_WORD_CLEANUP = re.compile(r'^(hey\s+jarvis|jarvis)[\s,]*', re.IGNORECASE)
 ACTION_OPEN = re.compile(r'^(open|launch|start|run)\s+', re.IGNORECASE)
 ACTION_SEARCH = re.compile(r'^(search for|search the web for|look up|who is|what is|when did|how many|what are)\s+', re.IGNORECASE)
 SEARCH_PREFIX_CLEANUP = re.compile(r'^(search for|search the web for|look up)\s+', re.IGNORECASE)
+ACTION_WEATHER = re.compile(r'\b(weather|temperature|how (hot|cold) is it|is it raining|is it going to rain)\b', re.IGNORECASE)
+WEATHER_CITY_STRIP = re.compile(
+    r"^(what'?s|what is|how'?s|how is|check|tell me)\s+(the\s+)?(weather|temperature)\s*(like)?\s*(in|at|for)?\s*",
+    re.IGNORECASE
+)
 PUNCTUATION_STRIP = re.compile(r'[^\w\s]')
 
 # --- Model Initialization ---
@@ -87,6 +119,64 @@ def scan_network_text():
 def get_time_text():
     return f"It's {datetime.now().strftime('%I:%M %p')} right now."
 
+def geocode_city(city_name):
+    try:
+        resp = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city_name, "count": 1},
+            timeout=5
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results")
+        if results:
+            r = results[0]
+            return r["latitude"], r["longitude"], r.get("name", city_name)
+    except requests.exceptions.RequestException:
+        pass
+    return None
+
+def get_weather_text(user_text):
+    # Pull an optional city out of the request, e.g. "what's the weather in Tokyo"
+    city = WEATHER_CITY_STRIP.sub('', user_text).strip()
+    city = PUNCTUATION_STRIP.sub('', city).strip()
+
+    lat, lon, place = HOME_LAT, HOME_LON, HOME_LOCATION_NAME
+    if city:
+        geo = geocode_city(city)
+        if geo:
+            lat, lon, place = geo
+
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,weather_code",
+                "temperature_unit": "celsius"
+            },
+            timeout=5
+        )
+        resp.raise_for_status()
+        current = resp.json()["current"]
+        temp = round(current["temperature_2m"])
+        condition = WEATHER_CODES.get(current["weather_code"], "unclear skies")
+        return f"It's currently {temp} degrees Celsius in {place}, with {condition}."
+    except requests.exceptions.RequestException:
+        return "I couldn't reach the weather service right now."
+    except (KeyError, ValueError):
+        return "I got a weather response I couldn't understand."
+
+def open_url_in_browser(url):
+    try:
+        res = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
 def open_any_app(user_text):
     # Strip trigger verbs and Whisper punctuation natively via precompiled regex
     app_name = ACTION_OPEN.sub('', user_text).strip()
@@ -95,7 +185,9 @@ def open_any_app(user_text):
     if not app_name:
         return "Which application would you like me to open?"
 
-    # Query Windows Start Menu via PowerShell
+    key = app_name.lower()
+
+    # 1. Prefer the actual installed app via the Windows Start Menu index.
     ps_script = f"""
     $app = Get-StartApps | Where-Object {{ $_.Name -match '{app_name}' }} | Select-Object -First 1
     if ($app) {{
@@ -116,7 +208,14 @@ def open_any_app(user_text):
     except Exception:
         pass
 
-    # Fallback to native Linux binary inside WSL
+    # 2. Not installed natively? Known web apps (WhatsApp, Netflix, YouTube...)
+    #    fall back to opening the website instead. Substring match so extra
+    #    words like "on system" don't break the lookup.
+    matched_url = next((url for name, url in WEB_APPS.items() if name in key), None)
+    if matched_url and open_url_in_browser(matched_url):
+        return f"Opening {app_name}."
+
+    # 3. Fallback to native Linux binary inside WSL
     try:
         subprocess.Popen([app_name.lower()], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return f"Opening {app_name} on Linux."
@@ -163,9 +262,10 @@ Decide ONE action from this list and reply with ONLY that word:
 - DONE (end conversation)
 - OPEN (explicitly ask to open/launch an app)
 - SEARCH (look up info, search web, factual questions)
+- WEATHER (weather, temperature, rain, forecast)
 - CHAT (default)
 
-Reply with exactly one word: SCAN, TIME, REMEMBER, STOP, DONE, OPEN, SEARCH, or CHAT"""
+Reply with exactly one word: SCAN, TIME, REMEMBER, STOP, DONE, OPEN, SEARCH, WEATHER, or CHAT"""
     response = ollama.generate(model=MODEL_NAME, prompt=prompt)
     return response["response"].strip().upper()
 
@@ -180,6 +280,8 @@ def process_interaction(user_text):
     # Fast-Path deterministic commands
     if ACTION_OPEN.match(cleaned_text):
         action = "OPEN"
+    elif ACTION_WEATHER.search(cleaned_text):
+        action = "WEATHER"
     elif ACTION_SEARCH.match(cleaned_text):
         action = "SEARCH"
     else:
@@ -213,6 +315,12 @@ def process_interaction(user_text):
         speak_streaming(llm_stream)
         return
         
+    elif "WEATHER" in action:
+        reply = get_weather_text(cleaned_text)
+        print(f"Jarvis: {reply}")
+        speak_streaming([{'message': {'content': reply}}])
+        return
+
     elif "SCAN" in action:
         reply = scan_network_text()
         print(f"Jarvis: {reply}")
